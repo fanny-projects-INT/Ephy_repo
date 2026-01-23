@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
 
 import numpy as np
 import pandas as pd
@@ -17,8 +17,8 @@ DEFAULTS: Dict[str, Any] = {
     "LABELS_NAME": "clusters.labels.csv",
     "OUT_DIRNAME": "qc_dashboard_png",
 
-    # NEW: if set (Path or str), all PNGs go there
-    # If None -> old behavior (per session / OUT_DIRNAME)
+    # If set (Path or str), all PNGs go there
+    # If None -> per session / OUT_DIRNAME
     "OUT_ROOT": None,
 
     # canvas
@@ -26,25 +26,31 @@ DEFAULTS: Dict[str, Any] = {
     "OUT_H_PX": 800,
     "OUT_DPI": 150,
 
-    # params
-    "DEPTH_BINS": 70,
-    "DEPTH_SMOOTH_SIGMA": 2.5,
+    # density (good clusters median depths)
+    "DEPTH_BINS": 80,
+    "DEPTH_SMOOTH_SIGMA": 2.2,
 
-    "TIME_BINS": 320,
-    "TIME_SMOOTH_SIGMA": 2.0,
-
-    "HEAT_TBINS": 180,
-    "HEAT_DBINS": 140,
-    "HEAT_MAX_POINTS": 700_000,
+    # heatmap
+    "HEAT_TBINS": 240,
+    "HEAT_DBINS": 260,
+    "HEAT_MAX_POINTS": 900_000,
     "HEAT_CLIP_PERCENTILE": 99.6,
     "HEAT_TIME_UNIT": "min",  # "s" or "min"
 
-    "FR_BINS": 40,
-    "FR_SMOOTH_SIGMA": 1.3,
+    # fixed depth axis (requested)
+    "HEAT_DEPTH_MIN": 0.0,
+    "HEAT_DEPTH_MAX": 4000.0,
+
+    # optional: fixed time axis max (None = auto from data)
+    "HEAT_TIME_MAX": None,  # e.g. 60.0 if HEAT_TIME_UNIT="min"
+
+    # IMPORTANT: avoid white holes in LogNorm
+    # If True: add +1 pseudo-count to all bins so zeros don't get masked by LogNorm
+    "HEAT_ADD_PSEUDOCOUNT": True,
 
     # style
     "BLUE": "#2A6FDB",
-    "TITLE_SIZE": 10.5,
+    "TITLE_SIZE": 11,
     "FONT_SIZE": 10,
 }
 
@@ -65,6 +71,7 @@ def apply_style(cfg: Dict[str, Any]) -> None:
         "axes.titleweight": "normal",
         "axes.titlesize": cfg["TITLE_SIZE"],
         "axes.labelsize": cfg["FONT_SIZE"],
+        "savefig.facecolor": "white",
     })
 
 
@@ -125,11 +132,14 @@ def load_probe_data(alf_probe: Path, labels_name: str):
 
 
 # ============================================================
-# Helpers / metrics
+# Helpers
 # ============================================================
 def gaussian_smooth(y: np.ndarray, sigma: float) -> np.ndarray:
     y = np.asarray(y, dtype=float)
     if y.size < 5:
+        return y
+    sigma = float(max(sigma, 0.0))
+    if sigma == 0.0:
         return y
     half = int(np.ceil(3 * sigma))
     x = np.arange(-half, half + 1, dtype=float)
@@ -140,7 +150,7 @@ def gaussian_smooth(y: np.ndarray, sigma: float) -> np.ndarray:
 
 
 def style_axes(ax):
-    ax.grid(alpha=0.12)
+    ax.grid(alpha=0.10)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
@@ -160,43 +170,10 @@ def compute_good_unit_depths(labels: pd.DataFrame, clusters: np.ndarray, depths:
     return np.asarray(out, dtype=float)
 
 
-def depth_density(good_depths: np.ndarray, bins: int, smooth_sigma: float) -> Tuple[np.ndarray, np.ndarray]:
-    counts, edges = np.histogram(good_depths, bins=bins)
-    centers = 0.5 * (edges[:-1] + edges[1:])
-    dens = counts.astype(float)
-    if dens.max() > 0:
-        dens /= dens.max()
-    dens = gaussian_smooth(dens, sigma=smooth_sigma)
-    if dens.max() > 0:
-        dens /= dens.max()
-    return centers, dens
-
-
-def good_spike_times(times: np.ndarray, clusters: np.ndarray, labels: pd.DataFrame) -> np.ndarray:
-    gids = good_cluster_ids(labels)
-    if gids.size == 0:
-        return np.array([], dtype=float)
-    m = np.isin(clusters, gids)
-    t = times[m]
-    t = t[np.isfinite(t)]
-    return t.astype(float)
-
-
-def spike_density_over_time(spike_times: np.ndarray, n_bins: int, smooth_sigma: float) -> Tuple[np.ndarray, np.ndarray]:
-    if spike_times.size == 0:
-        return np.array([]), np.array([])
-    tmax = float(np.nanmax(spike_times))
-    edges = np.linspace(0.0, tmax, n_bins + 1)
-    counts, _ = np.histogram(spike_times, bins=edges)
-    centers = 0.5 * (edges[:-1] + edges[1:])
-    y = gaussian_smooth(counts.astype(float), sigma=smooth_sigma)
-    return centers, y
-
-
 def get_good_spikes_time_depth(times: np.ndarray, clusters: np.ndarray, depths: np.ndarray, labels: pd.DataFrame):
     gids = good_cluster_ids(labels)
     if gids.size == 0:
-        return np.array([]), np.array([])
+        return np.array([], dtype=float), np.array([], dtype=float)
     m = np.isin(clusters, gids)
     t = times[m]
     d = depths[m]
@@ -204,26 +181,8 @@ def get_good_spikes_time_depth(times: np.ndarray, clusters: np.ndarray, depths: 
     return t[ok].astype(float), d[ok].astype(float)
 
 
-def compute_firing_rates_good_units(times: np.ndarray, clusters: np.ndarray, labels: pd.DataFrame) -> np.ndarray:
-    gids = good_cluster_ids(labels)
-    if gids.size == 0:
-        return np.array([], dtype=float)
-
-    rates = []
-    for cid in gids:
-        t = times[clusters == cid]
-        t = t[np.isfinite(t)]
-        if t.size < 2:
-            continue
-        duration = float(t.max() - t.min())
-        if duration <= 0:
-            continue
-        rates.append(float(t.size / duration))
-    return np.asarray(rates, dtype=float)
-
-
 # ============================================================
-# 1 dashboard per probe
+# Pro dashboard: top banner + (density | heatmap)
 # ============================================================
 def make_dashboard_png(
     session: str,
@@ -238,158 +197,198 @@ def make_dashboard_png(
     labels, clusters, depths, times = loaded
     blue = cfg["BLUE"]
 
+    # ---- summary
     n_good = int((labels["label"] == "good").sum())
     duration_s = float(np.nanmax(times)) if times.size else np.nan
     duration_min = duration_s / 60.0 if np.isfinite(duration_s) else np.nan
 
+    # ---- plot data
     good_depths = compute_good_unit_depths(labels, clusters, depths)
-    t_good = good_spike_times(times, clusters, labels)
-    t_cent, t_count = spike_density_over_time(t_good, cfg["TIME_BINS"], cfg["TIME_SMOOTH_SIGMA"])
     ht, hd = get_good_spikes_time_depth(times, clusters, depths, labels)
 
-    fr = compute_firing_rates_good_units(times, clusters, labels)
-    fr = fr[np.isfinite(fr) & (fr > 0)]
+    # ---- fixed depth range (requested)
+    dmin = float(cfg.get("HEAT_DEPTH_MIN", 0.0))
+    dmax = float(cfg.get("HEAT_DEPTH_MAX", 4000.0))
+    if not np.isfinite(dmin):
+        dmin = 0.0
+    if not np.isfinite(dmax) or dmax <= dmin:
+        dmax = dmin + 4000.0
 
+    # ---- figure
     fig_w_in = cfg["OUT_W_PX"] / cfg["OUT_DPI"]
     fig_h_in = cfg["OUT_H_PX"] / cfg["OUT_DPI"]
     fig = plt.figure(figsize=(fig_w_in, fig_h_in), dpi=cfg["OUT_DPI"], constrained_layout=True)
 
-    # Layout tuned: top row taller (FR less cramped) + spike density a bit lower
+    # 2 rows: banner + main plot
     gs = fig.add_gridspec(
-        nrows=3, ncols=3,
-        height_ratios=[0.42, 0.92, 1.20],
-        width_ratios=[0.75, 1.10, 1.10],
-        hspace=0.18,
-        wspace=0.18,
+        nrows=2, ncols=2,
+        height_ratios=[0.18, 1.0],
+        width_ratios=[0.22, 1.0],
+        hspace=0.02,
+        wspace=0.06,
     )
 
-    # ---- info (auto-fit box around text)
-    ax_info = fig.add_subplot(gs[0, 0])
-    ax_info.axis("off")
+    ax_banner = fig.add_subplot(gs[0, :])
+    ax_den    = fig.add_subplot(gs[1, 0])
+    ax_hm     = fig.add_subplot(gs[1, 1], sharey=ax_den)
 
-    info_text = (
-        f"mouse_ID : {session}\n"
-        f"probe     : {alf_probe.name}\n"
-        f"good units: {n_good}\n"
-        f"duration  : {duration_min:.1f} min"
-        if np.isfinite(duration_min) else
-        f"mouse_ID : {session}\nprobe     : {alf_probe.name}\ngood units: {n_good}\nduration  : NA"
-    )
+    # -------------------------
+    # Top banner (clean, not overlay)
+    # -------------------------
+    ax_banner.set_xlim(0, 1)
+    ax_banner.set_ylim(0, 1)
+    ax_banner.axis("off")
 
-    ax_info.text(
-        0.0, 0.95, info_text,
-        ha="left", va="top",
-        fontsize=cfg["FONT_SIZE"],
-        linespacing=1.35,
-        bbox=dict(
-            boxstyle="round,pad=0.35",
+    # background band
+    ax_banner.add_patch(
+        mpl.patches.FancyBboxPatch(
+            (0.0, 0.0), 1.0, 1.0,
+            boxstyle="round,pad=0.012,rounding_size=0.02",
             facecolor="#F7F7F7",
             edgecolor="#E6E6E6",
-            linewidth=0.8
+            linewidth=0.9,
+            transform=ax_banner.transAxes,
+            clip_on=False,
         )
     )
 
-    # ---- firing rate
-    ax_fr = fig.add_subplot(gs[0, 1:])
-    if fr.size >= 2:
-        bins = np.logspace(np.log10(fr.min()), np.log10(fr.max()), cfg["FR_BINS"])
-        hist, edges = np.histogram(fr, bins=bins, density=True)
-        centers = np.sqrt(edges[:-1] * edges[1:])
-        hist_s = gaussian_smooth(hist, sigma=cfg["FR_SMOOTH_SIGMA"])
+    dur_str = f"{duration_min:.1f} min" if np.isfinite(duration_min) else ("NA" if not np.isfinite(duration_s) else f"{duration_s:.1f} s")
+    left = f"mouse_ID: {session}   •   probe: {alf_probe.name}"
+    right = f"good units: {n_good}   •   duration: {dur_str}"
 
-        ax_fr.plot(centers, hist_s, color=blue, lw=1.9)
-        ax_fr.fill_between(centers, 0, hist_s, color=blue, alpha=0.15)
-        ax_fr.set_xscale("log")
+    ax_banner.text(0.02, 0.62, left, ha="left", va="center", fontsize=cfg["FONT_SIZE"] + 1)
+    ax_banner.text(0.02, 0.28, right, ha="left", va="center", fontsize=cfg["FONT_SIZE"])
+    # subtle divider line
+    ax_banner.plot([0.0, 1.0], [0.02, 0.02], color="#E6E6E6", lw=1.0, transform=ax_banner.transAxes)
 
-        ax_fr.set_title("Firing rate distribution (good units)", pad=4)
-        ax_fr.set_xlabel("Firing rate (Hz)")
-        ax_fr.set_ylabel("Density")
-        style_axes(ax_fr)
-    else:
-        ax_fr.axis("off")
+    # -------------------------
+    # Left: good unit density (median depth per good cluster)
+    # -------------------------
+    ax_den.set_title("Good unit density", pad=6)
 
-    # ---- depth density
-    ax_depth = fig.add_subplot(gs[1:, 0])
     if good_depths.size:
-        y, x = depth_density(good_depths, cfg["DEPTH_BINS"], cfg["DEPTH_SMOOTH_SIGMA"])
-        ax_depth.fill_betweenx(y, 0, x, color=blue, alpha=0.15)
-        ax_depth.plot(x, y, color=blue, lw=2.0)
-        ax_depth.set_ylim(y.max(), y.min())
-        ax_depth.set_xlim(0, 1.0)
+        gd = good_depths[np.isfinite(good_depths)]
+        gd = gd[(gd >= dmin) & (gd <= dmax)]
+        if gd.size:
+            counts, edges = np.histogram(gd, bins=int(cfg["DEPTH_BINS"]), range=(dmin, dmax))
+            centers = 0.5 * (edges[:-1] + edges[1:])
+            dens = counts.astype(float)
+            if dens.max() > 0:
+                dens /= dens.max()
+            dens = gaussian_smooth(dens, sigma=float(cfg["DEPTH_SMOOTH_SIGMA"]))
+            if dens.max() > 0:
+                dens /= dens.max()
 
-    ax_depth.set_title("Good unit density along depth", pad=4)
-    ax_depth.set_xlabel("Norm. density")
-    ax_depth.set_ylabel("Depth (µm)")
-    style_axes(ax_depth)
+            ax_den.fill_betweenx(centers, 0, dens, color=blue, alpha=0.18, linewidth=0)
+            ax_den.plot(dens, centers, color=blue, lw=2.2)
 
-    # ---- spike density over time
-    ax_time = fig.add_subplot(gs[1, 1:])
-    if t_cent.size:
-        ax_time.plot(t_cent, t_count, color=blue, lw=1.9)
-        ax_time.fill_between(t_cent, 0, t_count, color=blue, alpha=0.12)
+    ax_den.set_ylim(dmax, dmin)   # depth increases downward
+    ax_den.set_xlim(0, 1.02)
+    ax_den.set_xlabel("Norm.")
+    ax_den.set_ylabel("Depth (µm)")
+    style_axes(ax_den)
+    ax_den.spines["right"].set_visible(False)
 
-    ax_time.set_title("Good spike density over time", pad=4)
-    ax_time.set_xlabel("Time (s)")
-    ax_time.set_ylabel("Count / bin")
-    style_axes(ax_time)
+    # hide y ticks on heatmap side
+    ax_hm.tick_params(axis="y", which="both", left=False, labelleft=False)
 
-    # ---- heatmap
-    ax_hm = fig.add_subplot(gs[2, 1:])
+    # -------------------------
+    # Right: heatmap (good spikes time × depth) — no white holes
+    # -------------------------
+    ax_hm.set_title("Good spikes (time × depth)", pad=6)
+
     if ht.size:
-        if ht.size > cfg["HEAT_MAX_POINTS"]:
+        # downsample for speed
+        if ht.size > int(cfg["HEAT_MAX_POINTS"]):
             rng = np.random.default_rng(0)
-            idx = rng.choice(ht.size, size=cfg["HEAT_MAX_POINTS"], replace=False)
-            ht2 = ht[idx]
-            hd2 = hd[idx]
+            idx = rng.choice(ht.size, size=int(cfg["HEAT_MAX_POINTS"]), replace=False)
+            ht2 = ht[idx].astype(float)
+            hd2 = hd[idx].astype(float)
         else:
-            ht2, hd2 = ht, hd
+            ht2 = ht.astype(float)
+            hd2 = hd.astype(float)
 
-        if cfg["HEAT_TIME_UNIT"] == "min":
-            ht2 = ht2 / 60.0
-            xlabel = "Time (min)"
-        else:
-            xlabel = "Time (s)"
+        ok = np.isfinite(ht2) & np.isfinite(hd2)
+        ht2, hd2 = ht2[ok], hd2[ok]
 
-        t_edges = np.linspace(0.0, float(np.max(ht2)), cfg["HEAT_TBINS"] + 1)
-        d_edges = np.linspace(float(np.min(hd2)), float(np.max(hd2)), cfg["HEAT_DBINS"] + 1)
+        # clip to fixed depth range
+        mdepth = (hd2 >= dmin) & (hd2 <= dmax)
+        ht2, hd2 = ht2[mdepth], hd2[mdepth]
 
-        H, _, _ = np.histogram2d(ht2, hd2, bins=[t_edges, d_edges])
-        Z = H.T
+        if ht2.size:
+            # time unit conversion
+            if str(cfg.get("HEAT_TIME_UNIT", "min")).lower() == "min":
+                ht2 = ht2 / 60.0
+                xlabel = "Time (min)"
+            else:
+                xlabel = "Time (s)"
 
-        pos = Z[Z > 0]
-        if pos.size:
-            vmax = float(np.percentile(pos, cfg["HEAT_CLIP_PERCENTILE"]))
-            vmax = max(vmax, 1.0)
+            # time max
+            tmax_data = float(np.max(ht2))
+            tmax_cfg = cfg.get("HEAT_TIME_MAX", None)
+            tmax = float(tmax_cfg) if (tmax_cfg is not None and np.isfinite(float(tmax_cfg))) else tmax_data
+            tmax = max(tmax, 1e-6)
 
-            norm = LogNorm(vmin=1, vmax=vmax)
-            cmap = mpl.cm.magma.copy()
-            cmap.set_bad("black")
+            t_edges = np.linspace(0.0, tmax, int(cfg["HEAT_TBINS"]) + 1)
+            d_edges = np.linspace(dmin, dmax, int(cfg["HEAT_DBINS"]) + 1)
 
-            im = ax_hm.imshow(
-                Z,
-                aspect="auto",
-                origin="lower",
-                extent=[t_edges[0], t_edges[-1], d_edges[0], d_edges[-1]],
-                cmap=cmap,
-                norm=norm,
-                interpolation="bilinear",
-            )
-            ax_hm.set_ylim(d_edges[-1], d_edges[0])
+            H, _, _ = np.histogram2d(ht2, hd2, bins=[t_edges, d_edges])
+            Z = H.T  # depth x time
 
-            ax_hm.set_title("Good spikes (time × depth)", pad=4)
-            ax_hm.set_xlabel(xlabel)
-            ax_hm.set_ylabel("Depth (µm)")
-            ax_hm.spines["top"].set_visible(False)
-            ax_hm.spines["right"].set_visible(False)
+            # KEY FIX: LogNorm masks zeros (=> "holes"). Add +1 to avoid any masked bins.
+            if bool(cfg.get("HEAT_ADD_PSEUDOCOUNT", True)):
+                Zp = Z + 1.0
+                pos = Zp[np.isfinite(Zp)]
+                vmax = float(np.percentile(pos, float(cfg["HEAT_CLIP_PERCENTILE"])))
+                vmax = max(vmax, 2.0)
+                norm = LogNorm(vmin=1.0, vmax=vmax)
+                cbar_label = "Count + 1 (log)"
+                Zshow = Zp
+            else:
+                pos = Z[Z > 0]
+                if pos.size == 0:
+                    ax_hm.axis("off")
+                    Zshow = None
+                    norm = None
+                    cbar_label = ""
+                else:
+                    vmax = float(np.percentile(pos, float(cfg["HEAT_CLIP_PERCENTILE"])))
+                    vmax = max(vmax, 1.0)
+                    norm = LogNorm(vmin=1.0, vmax=vmax)
+                    cbar_label = "Count (log)"
+                    Zshow = Z
 
-            cbar = fig.colorbar(im, ax=ax_hm, fraction=0.030, pad=0.018)
-            cbar.outline.set_visible(False)
-            cbar.set_label("Count (log)", rotation=90)
+            if Zshow is not None:
+                cmap = mpl.cm.magma.copy()
+                # keep a clean background: minimum value uses the colormap minimum (no white)
+                # (no set_bad needed because we no longer have masked zeros)
+
+                im = ax_hm.imshow(
+                    Zshow,
+                    aspect="auto",
+                    origin="lower",
+                    extent=[t_edges[0], t_edges[-1], d_edges[0], d_edges[-1]],
+                    cmap=cmap,
+                    norm=norm,
+                    interpolation="nearest",  # crisp, pro (avoid smearing)
+                )
+
+                ax_hm.set_ylim(dmax, dmin)
+                ax_hm.set_xlabel(xlabel)
+                ax_hm.set_ylabel("")
+                ax_hm.spines["top"].set_visible(False)
+                ax_hm.spines["right"].set_visible(False)
+
+                cbar = fig.colorbar(im, ax=ax_hm, fraction=0.030, pad=0.015)
+                cbar.outline.set_visible(False)
+                cbar.set_label(cbar_label, rotation=90)
+
         else:
             ax_hm.axis("off")
     else:
         ax_hm.axis("off")
 
+    # Save
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=cfg["OUT_DPI"])
     plt.close(fig)
@@ -404,7 +403,7 @@ def list_sessions_with_labels(root: Path, labels_name: str) -> List[str]:
     for csv in root.rglob(labels_name):
         try:
             rel = csv.relative_to(root)
-            sessions.add(rel.parts[0])  # session folder directly under root
+            sessions.add(rel.parts[0])
         except Exception:
             pass
     return sorted(sessions)
@@ -423,7 +422,6 @@ def run_dashboards(
     else:
         sessions = list(run_mode)
 
-    # output dir: either global OUT_ROOT or per-session OUT_DIRNAME
     out_root = cfg.get("OUT_ROOT", None)
     out_root_path = Path(out_root) if out_root else None
     if out_root_path:
@@ -449,3 +447,7 @@ def run_dashboards(
                 print(f"[OK] {out_png}")
             else:
                 print(f"[SKIP] {session} / {alf_probe.name}")
+
+
+if __name__ == "__main__":
+    print("Import this module and call run_dashboards(data_root, run_mode, cfg).")
