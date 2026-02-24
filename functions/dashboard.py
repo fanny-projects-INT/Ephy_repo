@@ -1,453 +1,415 @@
+# dashboard.py
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, Tuple, Dict, List
+import json
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 from matplotlib.colors import LogNorm
+from matplotlib.patches import Rectangle
 
 
-# ============================================================
-# Config defaults (can be overridden from run script)
-# ============================================================
-DEFAULTS: Dict[str, Any] = {
-    "LABELS_NAME": "clusters.labels.csv",
-    "OUT_DIRNAME": "qc_dashboard_png",
+def plot_good_spikes_heatmap_with_regions(
+    alf_probe: Path,
+    channel_locations_json: Optional[Path] = None,
+    labels_name: str = "clusters.labels.csv",
+    *,
+    # ------------------------------------------------------------
+    # DEPTH CONVENTION
+    # ------------------------------------------------------------
+    depth_max: float = 4000.0,  # µm from tip; display 0 bottom, depth_max top
 
-    # If set (Path or str), all PNGs go there
-    # If None -> per session / OUT_DIRNAME
-    "OUT_ROOT": None,
+    # ------------------------------------------------------------
+    # HEATMAP (high resolution)
+    # ------------------------------------------------------------
+    heat_time_unit: str = "min",
+    heat_tbins: int = 700,
+    heat_dbins: int = 900,
+    heat_max_points: int = 1_500_000,
+    heat_clip_percentile: float = 99.6,
+    heat_add_pseudocount: bool = True,
+    heat_time_max: Optional[float] = None,
+    heat_cmap: str = "inferno",
+    heat_smooth_sigma_t: float = 0.7,
+    heat_smooth_sigma_d: float = 0.7,
+    heat_interpolation: str = "bilinear",
 
-    # canvas
-    "OUT_W_PX": 1400,
-    "OUT_H_PX": 800,
-    "OUT_DPI": 150,
+    # ------------------------------------------------------------
+    # RAIL HEATMAP (in negative time, BEFORE t=0)
+    # ------------------------------------------------------------
+    hm_rail_time_frac: float = 0.05,   # rail width as fraction of heatmap time span
+    rail_alpha: float = 0.92,
 
-    # density (good clusters median depths)
-    "DEPTH_BINS": 80,
-    "DEPTH_SMOOTH_SIGMA": 2.2,
+    # ------------------------------------------------------------
+    # DENSITY (good units)
+    # ------------------------------------------------------------
+    depth_bins: int = 140,
+    depth_smooth_sigma: float = 0.9,
+    density_line_lw: float = 2.4,
+    density_fill_alpha: float = 0.20,
 
-    # heatmap
-    "HEAT_TBINS": 240,
-    "HEAT_DBINS": 260,
-    "HEAT_MAX_POINTS": 900_000,
-    "HEAT_CLIP_PERCENTILE": 99.6,
-    "HEAT_TIME_UNIT": "min",  # "s" or "min"
+    # Density rail (strictly on [-den_rail_width, 0])
+    den_rail_width: float = 0.28,      # curve is on [0..1]
+    den_rail_alpha: float = 0.92,
 
-    # fixed depth axis (requested)
-    "HEAT_DEPTH_MIN": 0.0,
-    "HEAT_DEPTH_MAX": 4000.0,
+    # ------------------------------------------------------------
+    # REGIONS / LABELS / SEPARATORS
+    # ------------------------------------------------------------
+    show_separators: bool = True,
+    separator_lw: float = 1.1,
+    separator_alpha: float = 0.9,
+    separator_color: Tuple[float, float, float] = (1.0, 1.0, 1.0),
 
-    # optional: fixed time axis max (None = auto from data)
-    "HEAT_TIME_MAX": None,  # e.g. 60.0 if HEAT_TIME_UNIT="min"
+    region_label: bool = True,
+    region_label_fontsize: int = 9,
+    region_label_min_height_um: float = 120.0,
 
-    # IMPORTANT: avoid white holes in LogNorm
-    # If True: add +1 pseudo-count to all bins so zeros don't get masked by LogNorm
-    "HEAT_ADD_PSEUDOCOUNT": True,
+    # ------------------------------------------------------------
+    # FIGURE
+    # ------------------------------------------------------------
+    figsize: Tuple[float, float] = (13.6, 7.0),
+    dpi: int = 150,
+    title: Optional[str] = None,
+    density_title: str = "Good unit density",
+) -> Tuple[plt.Figure, Dict[str, plt.Axes]]:
+    """
+    - Heatmap: GOOD spikes only, high-res, lightly smoothed
+    - Heatmap region rail is drawn in negative time (before t=0), so it never overlaps heatmap
+      and sits just to the right of the Y-axis.
+    - Density rail is drawn strictly on x in [-den_rail_width, 0] with NO HOLES
+      (regions are filled for all depths using ffill/bfill).
+    - Density curve is a single colored line (per-region segments), no double line.
+    """
 
-    # style
-    "BLUE": "#2A6FDB",
-    "TITLE_SIZE": 11,
-    "FONT_SIZE": 10,
-}
+    alf_probe = Path(alf_probe)
+    depth_max = float(depth_max)
 
+    # ============================================================
+    # Load labels
+    # ============================================================
+    labels = pd.read_csv(alf_probe / labels_name)
+    if ("label" not in labels.columns) or ("cluster_id" not in labels.columns):
+        raise ValueError(f"{labels_name} must contain columns: cluster_id, label")
+    labels["label"] = labels["label"].astype(str).str.lower().str.strip()
+    labels["cluster_id"] = pd.to_numeric(labels["cluster_id"], errors="coerce")
+    labels = labels.dropna(subset=["cluster_id"])
+    labels["cluster_id"] = labels["cluster_id"].astype(int)
+    good_ids = labels.loc[labels["label"] == "good", "cluster_id"].to_numpy(dtype=int)
 
-# ============================================================
-# Style
-# ============================================================
-def apply_style(cfg: Dict[str, Any]) -> None:
-    plt.rcParams.update({
-        "figure.facecolor": "white",
-        "axes.facecolor": "white",
-        "axes.edgecolor": "#E6E6E6",
-        "axes.labelcolor": "#333333",
-        "text.color": "#222222",
-        "xtick.color": "#666666",
-        "ytick.color": "#666666",
-        "font.size": cfg["FONT_SIZE"],
-        "axes.titleweight": "normal",
-        "axes.titlesize": cfg["TITLE_SIZE"],
-        "axes.labelsize": cfg["FONT_SIZE"],
-        "savefig.facecolor": "white",
-    })
-
-
-# ============================================================
-# IO
-# ============================================================
-def load_npy(path: Path) -> Optional[np.ndarray]:
-    try:
-        return np.load(path, mmap_mode="r")
-    except Exception:
-        return None
-
-
-def read_labels(labels_csv: Path) -> Optional[pd.DataFrame]:
-    try:
-        df = pd.read_csv(labels_csv)
-    except Exception:
-        return None
-
-    if "label" not in df.columns or "cluster_id" not in df.columns:
-        return None
-
-    df["label"] = df["label"].astype(str).str.lower().str.strip()
-    df["cluster_id"] = pd.to_numeric(df["cluster_id"], errors="coerce")
-    df = df.dropna(subset=["cluster_id"])
-    df["cluster_id"] = df["cluster_id"].astype(int)
-    return df
-
-
-def find_probes_for_session(root: Path, session: str, labels_name: str) -> List[Path]:
-    session_folder = root / session
-    if not session_folder.exists():
-        return []
-    csvs = list(session_folder.rglob(labels_name))
-    return sorted({c.parent for c in csvs})
-
-
-def load_probe_data(alf_probe: Path, labels_name: str):
-    labels = read_labels(alf_probe / labels_name)
-    if labels is None:
-        return None
-
-    clusters = load_npy(alf_probe / "spikes.clusters.npy")
-    depths   = load_npy(alf_probe / "spikes.depths.npy")
-    times    = load_npy(alf_probe / "spikes.times.npy")
-
-    if clusters is None or depths is None or times is None:
-        return None
-
-    clusters = np.asarray(clusters).astype(int, copy=False)
-    depths = np.asarray(depths).astype(float, copy=False)
-    times = np.asarray(times).astype(float, copy=False)
+    # ============================================================
+    # Load spikes
+    # ============================================================
+    clusters = np.load(alf_probe / "spikes.clusters.npy", mmap_mode="r").astype(int, copy=False)
+    depths   = np.load(alf_probe / "spikes.depths.npy",   mmap_mode="r").astype(float, copy=False)
+    times    = np.load(alf_probe / "spikes.times.npy",    mmap_mode="r").astype(float, copy=False)
 
     if not (clusters.shape[0] == depths.shape[0] == times.shape[0]):
-        return None
+        raise ValueError("spikes arrays must have same length")
 
-    return labels, clusters, depths, times
+    # ============================================================
+    # GOOD spikes ONLY
+    # ============================================================
+    if good_ids.size:
+        m = np.isin(clusters, good_ids)
+        t = times[m].astype(float)
+        d = depths[m].astype(float)
+        ok = np.isfinite(t) & np.isfinite(d)
+        t, d = t[ok], d[ok]
+    else:
+        t = np.array([], dtype=float)
+        d = np.array([], dtype=float)
 
+    d = np.clip(d, 0.0, depth_max)
 
-# ============================================================
-# Helpers
-# ============================================================
-def gaussian_smooth(y: np.ndarray, sigma: float) -> np.ndarray:
-    y = np.asarray(y, dtype=float)
-    if y.size < 5:
-        return y
-    sigma = float(max(sigma, 0.0))
-    if sigma == 0.0:
-        return y
-    half = int(np.ceil(3 * sigma))
-    x = np.arange(-half, half + 1, dtype=float)
-    k = np.exp(-0.5 * (x / sigma) ** 2)
-    k /= k.sum()
-    ypad = np.pad(y, (half, half), mode="reflect")
-    return np.convolve(ypad, k, mode="valid")
+    # Downsample
+    if t.size > int(heat_max_points):
+        rng = np.random.default_rng(0)
+        idx = rng.choice(t.size, size=int(heat_max_points), replace=False)
+        t, d = t[idx], d[idx]
 
+    # Time unit
+    if str(heat_time_unit).lower() == "min":
+        t = t / 60.0
+        xlabel = "Time (min)"
+    else:
+        xlabel = "Time (s)"
 
-def style_axes(ax):
-    ax.grid(alpha=0.10)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
+    tmax = float(heat_time_max) if (heat_time_max is not None and np.isfinite(float(heat_time_max))) else (float(np.max(t)) if t.size else 1.0)
+    tmax = max(tmax, 1e-6)
 
+    # ============================================================
+    # Heatmap histogram
+    # ============================================================
+    H, t_edges, d_edges = np.histogram2d(
+        t, d,
+        bins=[int(heat_tbins), int(heat_dbins)],
+        range=[[0.0, tmax], [0.0, depth_max]],
+    )
+    Z = H.T
+    if bool(heat_add_pseudocount):
+        Z = Z + 1.0
 
-def good_cluster_ids(labels: pd.DataFrame) -> np.ndarray:
-    return labels.loc[labels["label"] == "good", "cluster_id"].to_numpy(dtype=int)
+    # Smooth (bin-space gaussian, no scipy)
+    def _gauss_kernel(sigma: float) -> np.ndarray:
+        if sigma <= 0:
+            return np.array([1.0], dtype=float)
+        half = int(np.ceil(3 * sigma))
+        x = np.arange(-half, half + 1, dtype=float)
+        k = np.exp(-0.5 * (x / sigma) ** 2)
+        k /= k.sum()
+        return k
 
+    def _conv1d_reflect(A: np.ndarray, k: np.ndarray, axis: int) -> np.ndarray:
+        if k.size == 1:
+            return A
+        half = (k.size - 1) // 2
+        pad = [(0, 0)] * A.ndim
+        pad[axis] = (half, half)
+        Ap = np.pad(A, pad, mode="reflect")
+        return np.apply_along_axis(lambda v: np.convolve(v, k, mode="valid"), axis, Ap)
 
-def compute_good_unit_depths(labels: pd.DataFrame, clusters: np.ndarray, depths: np.ndarray) -> np.ndarray:
-    gids = good_cluster_ids(labels)
-    out = []
-    for cid in gids:
-        d = depths[clusters == cid]
-        d = d[np.isfinite(d)]
-        if d.size:
-            out.append(float(np.median(d)))
-    return np.asarray(out, dtype=float)
+    Z = _conv1d_reflect(Z, _gauss_kernel(float(heat_smooth_sigma_d)), axis=0)
+    Z = _conv1d_reflect(Z, _gauss_kernel(float(heat_smooth_sigma_t)), axis=1)
 
+    # Norm
+    pos = Z[np.isfinite(Z)]
+    vmax = float(np.percentile(pos, float(heat_clip_percentile))) if pos.size else 2.0
+    vmax = max(vmax, 2.0)
+    norm = LogNorm(vmin=1.0, vmax=vmax)
 
-def get_good_spikes_time_depth(times: np.ndarray, clusters: np.ndarray, depths: np.ndarray, labels: pd.DataFrame):
-    gids = good_cluster_ids(labels)
-    if gids.size == 0:
-        return np.array([], dtype=float), np.array([], dtype=float)
-    m = np.isin(clusters, gids)
-    t = times[m]
-    d = depths[m]
-    ok = np.isfinite(t) & np.isfinite(d)
-    return t[ok].astype(float), d[ok].astype(float)
+    # ============================================================
+    # Regions -> segments + colors
+    # ============================================================
+    segments: List[Tuple[float, float, str]] = []
+    region_colors: Dict[str, Tuple[float, float, float]] = {}
 
+    if channel_locations_json is not None and Path(channel_locations_json).exists():
+        with open(channel_locations_json, "r", encoding="utf-8") as f:
+            ch = json.load(f)
 
-# ============================================================
-# Pro dashboard: top banner + (density | heatmap)
-# ============================================================
-def make_dashboard_png(
-    session: str,
-    alf_probe: Path,
-    out_png: Path,
-    cfg: Dict[str, Any],
-) -> bool:
-    loaded = load_probe_data(alf_probe, cfg["LABELS_NAME"])
-    if loaded is None:
-        return False
+        rows = []
+        for v in ch.values():
+            if isinstance(v, dict) and ("axial" in v) and ("brain_region" in v):
+                try:
+                    rows.append((float(v["axial"]), str(v["brain_region"])))
+                except Exception:
+                    pass
 
-    labels, clusters, depths, times = loaded
-    blue = cfg["BLUE"]
+        rows.sort(key=lambda x: x[0])
 
-    # ---- summary
-    n_good = int((labels["label"] == "good").sum())
-    duration_s = float(np.nanmax(times)) if times.size else np.nan
-    duration_min = duration_s / 60.0 if np.isfinite(duration_s) else np.nan
+        if rows:
+            ax = np.array([r[0] for r in rows], dtype=float)
+            regs = [r[1] for r in rows]
+            mids = (ax[:-1] + ax[1:]) / 2 if len(ax) > 1 else np.array([], dtype=float)
 
-    # ---- plot data
-    good_depths = compute_good_unit_depths(labels, clusters, depths)
-    ht, hd = get_good_spikes_time_depth(times, clusters, depths, labels)
+            start = float(ax[0])
+            cur = regs[0]
+            for i in range(1, len(ax)):
+                if regs[i] != cur:
+                    end = float(mids[i - 1]) if mids.size else float(ax[i])
+                    if end > start:
+                        segments.append((start, end, cur))
+                    start = end
+                    cur = regs[i]
+            end_last = float(ax[-1])
+            if end_last > start:
+                segments.append((start, end_last, cur))
 
-    # ---- fixed depth range (requested)
-    dmin = float(cfg.get("HEAT_DEPTH_MIN", 0.0))
-    dmax = float(cfg.get("HEAT_DEPTH_MAX", 4000.0))
-    if not np.isfinite(dmin):
-        dmin = 0.0
-    if not np.isfinite(dmax) or dmax <= dmin:
-        dmax = dmin + 4000.0
+            # clip
+            seg2 = []
+            for a, b, r in segments:
+                aa = max(0.0, min(depth_max, a))
+                bb = max(0.0, min(depth_max, b))
+                if bb > aa:
+                    seg2.append((aa, bb, r))
+            segments = seg2
 
-    # ---- figure
-    fig_w_in = cfg["OUT_W_PX"] / cfg["OUT_DPI"]
-    fig_h_in = cfg["OUT_H_PX"] / cfg["OUT_DPI"]
-    fig = plt.figure(figsize=(fig_w_in, fig_h_in), dpi=cfg["OUT_DPI"], constrained_layout=True)
+            uniq = sorted({r for _, _, r in segments})
+            cmap_regions = mpl.cm.tab20
+            for i, r in enumerate(uniq):
+                region_colors[r] = cmap_regions(i % cmap_regions.N)[:3]
 
-    # 2 rows: banner + main plot
-    gs = fig.add_gridspec(
-        nrows=2, ncols=2,
-        height_ratios=[0.18, 1.0],
-        width_ratios=[0.22, 1.0],
-        hspace=0.02,
-        wspace=0.06,
+    # ============================================================
+    # Density curve (good units)
+    # ============================================================
+    good_unit_depths = []
+    for cid in good_ids:
+        dd = depths[clusters == cid]
+        dd = np.asarray(dd, dtype=float)
+        dd = dd[np.isfinite(dd)]
+        if dd.size:
+            good_unit_depths.append(float(np.median(dd)))
+    good_unit_depths = np.clip(np.asarray(good_unit_depths, dtype=float), 0.0, depth_max)
+
+    counts, edges = np.histogram(good_unit_depths, bins=int(depth_bins), range=(0.0, depth_max))
+    y_centers = 0.5 * (edges[:-1] + edges[1:])
+    dens = counts.astype(float)
+    if dens.max() > 0:
+        dens /= dens.max()
+
+    if depth_smooth_sigma > 0:
+        sigma = float(depth_smooth_sigma)
+        half = int(np.ceil(3 * sigma))
+        x = np.arange(-half, half + 1, dtype=float)
+        k = np.exp(-0.5 * (x / sigma) ** 2)
+        k /= k.sum()
+        dens = np.convolve(np.pad(dens, (half, half), mode="reflect"), k, mode="valid")
+        if dens.max() > 0:
+            dens /= dens.max()
+
+    # ============================================================
+    # Fill holes in region assignment along y_centers (NO holes in rail)
+    # ============================================================
+    def region_per_depth(y: np.ndarray) -> np.ndarray:
+        lab = np.array([None] * y.size, dtype=object)
+        for a, b, r in segments:
+            m = (y >= a) & (y <= b)
+            lab[m] = r
+        s = pd.Series(lab, dtype="object").ffill().bfill().fillna("UNK")
+        return s.to_numpy(dtype=object)
+
+    lab_y = region_per_depth(y_centers)
+
+    # boundaries from changes (for clean separators)
+    change = np.flatnonzero(lab_y[1:] != lab_y[:-1])
+    bounds = [0.5 * (y_centers[i] + y_centers[i + 1]) for i in change]
+
+    # ============================================================
+    # FIGURE
+    # ============================================================
+    fig = plt.figure(figsize=figsize, dpi=dpi, constrained_layout=True)
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.0, 0.30], wspace=0.08)
+
+    ax_hm = fig.add_subplot(gs[0, 0])
+    ax_den = fig.add_subplot(gs[0, 1], sharey=ax_hm)
+
+    ax_hm.set_title(title if title else alf_probe.name, pad=8)
+    ax_den.set_title(density_title, pad=8)
+
+    # ----------------------------
+    # Heatmap
+    # ----------------------------
+    cmap = mpl.cm.get_cmap(heat_cmap)
+    im = ax_hm.imshow(
+        Z,
+        origin="lower",
+        aspect="auto",
+        extent=[0.0, tmax, 0.0, depth_max],
+        cmap=cmap,
+        norm=norm,
+        interpolation=str(heat_interpolation),
+        zorder=1,
     )
 
-    ax_banner = fig.add_subplot(gs[0, :])
-    ax_den    = fig.add_subplot(gs[1, 0])
-    ax_hm     = fig.add_subplot(gs[1, 1], sharey=ax_den)
+    # Extend xlim to show negative-time rail area (before t=0)
+    rail_t = float(hm_rail_time_frac) * tmax
+    ax_hm.set_xlim(-rail_t, tmax)
 
-    # -------------------------
-    # Top banner (clean, not overlay)
-    # -------------------------
-    ax_banner.set_xlim(0, 1)
-    ax_banner.set_ylim(0, 1)
-    ax_banner.axis("off")
+    ax_hm.set_xlabel(xlabel)
+    ax_hm.set_ylabel("Depth from tip (µm)")
+    ax_hm.spines["top"].set_visible(False)
+    ax_hm.spines["right"].set_visible(False)
 
-    # background band
-    ax_banner.add_patch(
-        mpl.patches.FancyBboxPatch(
-            (0.0, 0.0), 1.0, 1.0,
-            boxstyle="round,pad=0.012,rounding_size=0.02",
-            facecolor="#F7F7F7",
-            edgecolor="#E6E6E6",
-            linewidth=0.9,
-            transform=ax_banner.transAxes,
-            clip_on=False,
-        )
-    )
+    cbar = fig.colorbar(im, ax=ax_hm, fraction=0.030, pad=0.015)
+    cbar.outline.set_visible(False)
+    cbar.set_label("Good spike count (log)")
 
-    dur_str = f"{duration_min:.1f} min" if np.isfinite(duration_min) else ("NA" if not np.isfinite(duration_s) else f"{duration_s:.1f} s")
-    left = f"mouse_ID: {session}   •   probe: {alf_probe.name}"
-    right = f"good units: {n_good}   •   duration: {dur_str}"
+    # ----------------------------
+    # Heatmap rail in NEGATIVE TIME (right of Y-axis, before t=0)
+    # ----------------------------
+    if segments:
+        for a, b, r in segments:
+            col = region_colors.get(r, (0.7, 0.7, 0.7))
+            ax_hm.add_patch(
+                Rectangle(
+                    (-rail_t, a),  # x start (negative time), y start
+                    rail_t,        # width
+                    (b - a),       # height
+                    facecolor=col,
+                    edgecolor="none",
+                    alpha=rail_alpha,
+                    zorder=4,
+                )
+            )
 
-    ax_banner.text(0.02, 0.62, left, ha="left", va="center", fontsize=cfg["FONT_SIZE"] + 1)
-    ax_banner.text(0.02, 0.28, right, ha="left", va="center", fontsize=cfg["FONT_SIZE"])
-    # subtle divider line
-    ax_banner.plot([0.0, 1.0], [0.02, 0.02], color="#E6E6E6", lw=1.0, transform=ax_banner.transAxes)
+        if show_separators:
+            for y in bounds:
+                ax_hm.axhline(y, color=separator_color, lw=separator_lw, alpha=separator_alpha, zorder=6)
 
-    # -------------------------
-    # Left: good unit density (median depth per good cluster)
-    # -------------------------
-    ax_den.set_title("Good unit density", pad=6)
-
-    if good_depths.size:
-        gd = good_depths[np.isfinite(good_depths)]
-        gd = gd[(gd >= dmin) & (gd <= dmax)]
-        if gd.size:
-            counts, edges = np.histogram(gd, bins=int(cfg["DEPTH_BINS"]), range=(dmin, dmax))
-            centers = 0.5 * (edges[:-1] + edges[1:])
-            dens = counts.astype(float)
-            if dens.max() > 0:
-                dens /= dens.max()
-            dens = gaussian_smooth(dens, sigma=float(cfg["DEPTH_SMOOTH_SIGMA"]))
-            if dens.max() > 0:
-                dens /= dens.max()
-
-            ax_den.fill_betweenx(centers, 0, dens, color=blue, alpha=0.18, linewidth=0)
-            ax_den.plot(dens, centers, color=blue, lw=2.2)
-
-    ax_den.set_ylim(dmax, dmin)   # depth increases downward
-    ax_den.set_xlim(0, 1.02)
-    ax_den.set_xlabel("Norm.")
-    ax_den.set_ylabel("Depth (µm)")
-    style_axes(ax_den)
-    ax_den.spines["right"].set_visible(False)
-
-    # hide y ticks on heatmap side
-    ax_hm.tick_params(axis="y", which="both", left=False, labelleft=False)
-
-    # -------------------------
-    # Right: heatmap (good spikes time × depth) — no white holes
-    # -------------------------
-    ax_hm.set_title("Good spikes (time × depth)", pad=6)
-
-    if ht.size:
-        # downsample for speed
-        if ht.size > int(cfg["HEAT_MAX_POINTS"]):
-            rng = np.random.default_rng(0)
-            idx = rng.choice(ht.size, size=int(cfg["HEAT_MAX_POINTS"]), replace=False)
-            ht2 = ht[idx].astype(float)
-            hd2 = hd[idx].astype(float)
-        else:
-            ht2 = ht.astype(float)
-            hd2 = hd.astype(float)
-
-        ok = np.isfinite(ht2) & np.isfinite(hd2)
-        ht2, hd2 = ht2[ok], hd2[ok]
-
-        # clip to fixed depth range
-        mdepth = (hd2 >= dmin) & (hd2 <= dmax)
-        ht2, hd2 = ht2[mdepth], hd2[mdepth]
-
-        if ht2.size:
-            # time unit conversion
-            if str(cfg.get("HEAT_TIME_UNIT", "min")).lower() == "min":
-                ht2 = ht2 / 60.0
-                xlabel = "Time (min)"
-            else:
-                xlabel = "Time (s)"
-
-            # time max
-            tmax_data = float(np.max(ht2))
-            tmax_cfg = cfg.get("HEAT_TIME_MAX", None)
-            tmax = float(tmax_cfg) if (tmax_cfg is not None and np.isfinite(float(tmax_cfg))) else tmax_data
-            tmax = max(tmax, 1e-6)
-
-            t_edges = np.linspace(0.0, tmax, int(cfg["HEAT_TBINS"]) + 1)
-            d_edges = np.linspace(dmin, dmax, int(cfg["HEAT_DBINS"]) + 1)
-
-            H, _, _ = np.histogram2d(ht2, hd2, bins=[t_edges, d_edges])
-            Z = H.T  # depth x time
-
-            # KEY FIX: LogNorm masks zeros (=> "holes"). Add +1 to avoid any masked bins.
-            if bool(cfg.get("HEAT_ADD_PSEUDOCOUNT", True)):
-                Zp = Z + 1.0
-                pos = Zp[np.isfinite(Zp)]
-                vmax = float(np.percentile(pos, float(cfg["HEAT_CLIP_PERCENTILE"])))
-                vmax = max(vmax, 2.0)
-                norm = LogNorm(vmin=1.0, vmax=vmax)
-                cbar_label = "Count + 1 (log)"
-                Zshow = Zp
-            else:
-                pos = Z[Z > 0]
-                if pos.size == 0:
-                    ax_hm.axis("off")
-                    Zshow = None
-                    norm = None
-                    cbar_label = ""
-                else:
-                    vmax = float(np.percentile(pos, float(cfg["HEAT_CLIP_PERCENTILE"])))
-                    vmax = max(vmax, 1.0)
-                    norm = LogNorm(vmin=1.0, vmax=vmax)
-                    cbar_label = "Count (log)"
-                    Zshow = Z
-
-            if Zshow is not None:
-                cmap = mpl.cm.magma.copy()
-                # keep a clean background: minimum value uses the colormap minimum (no white)
-                # (no set_bad needed because we no longer have masked zeros)
-
-                im = ax_hm.imshow(
-                    Zshow,
-                    aspect="auto",
-                    origin="lower",
-                    extent=[t_edges[0], t_edges[-1], d_edges[0], d_edges[-1]],
-                    cmap=cmap,
-                    norm=norm,
-                    interpolation="nearest",  # crisp, pro (avoid smearing)
+        # Labels (only for large segments)
+        if region_label:
+            for a, b, r in segments:
+                if (b - a) < float(region_label_min_height_um):
+                    continue
+                col = region_colors.get(r, (0.7, 0.7, 0.7))
+                ax_hm.text(
+                    0.01, 0.5 * (a + b), r,
+                    transform=ax_hm.get_yaxis_transform(),
+                    ha="left", va="center",
+                    fontsize=region_label_fontsize,
+                    color="white",
+                    bbox=dict(boxstyle="round,pad=0.15", fc=(*col, 0.92), ec="none"),
+                    zorder=7,
                 )
 
-                ax_hm.set_ylim(dmax, dmin)
-                ax_hm.set_xlabel(xlabel)
-                ax_hm.set_ylabel("")
-                ax_hm.spines["top"].set_visible(False)
-                ax_hm.spines["right"].set_visible(False)
+    # ----------------------------
+    # Density panel: rail ONLY up to x=0 (no overlap) + curve colored everywhere
+    # ----------------------------
+    ax_den.set_xlabel("Norm.")
+    ax_den.set_xlim(-float(den_rail_width), 1.02)
+    ax_den.yaxis.set_visible(False)
+    ax_den.spines["top"].set_visible(False)
+    ax_den.spines["right"].set_visible(False)
 
-                cbar = fig.colorbar(im, ax=ax_hm, fraction=0.030, pad=0.015)
-                cbar.outline.set_visible(False)
-                cbar.set_label(cbar_label, rotation=90)
+    # Rail blocks based on lab_y (NO HOLES)
+    start = 0
+    while start < y_centers.size:
+        rr = lab_y[start]
+        end = start + 1
+        while end < y_centers.size and lab_y[end] == rr:
+            end += 1
 
-        else:
-            ax_hm.axis("off")
-    else:
-        ax_hm.axis("off")
+        col = region_colors.get(rr, (0.7, 0.7, 0.7))
 
-    # Save
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_png, dpi=cfg["OUT_DPI"])
-    plt.close(fig)
-    return True
+        y0 = edges[start]
+        y1 = edges[end] if end < edges.size else edges[-1]
 
+        ax_den.fill_betweenx([y0, y1], -float(den_rail_width), 0.0, color=col, alpha=den_rail_alpha, linewidth=0, zorder=1)
 
-# ============================================================
-# Run helpers
-# ============================================================
-def list_sessions_with_labels(root: Path, labels_name: str) -> List[str]:
-    sessions = set()
-    for csv in root.rglob(labels_name):
-        try:
-            rel = csv.relative_to(root)
-            sessions.add(rel.parts[0])
-        except Exception:
-            pass
-    return sorted(sessions)
+        if region_label and (y1 - y0) >= float(region_label_min_height_um):
+            ax_den.text(
+                -float(den_rail_width) + 0.02, 0.5 * (y0 + y1), rr,
+                ha="left", va="center",
+                fontsize=region_label_fontsize,
+                color="white",
+                bbox=dict(boxstyle="round,pad=0.15", fc=(*col, 0.92), ec="none"),
+                zorder=3,
+            )
 
+        start = end
 
-def run_dashboards(
-    data_root: Path,
-    run_mode: List[str] | str,
-    cfg: Dict[str, Any],
-) -> None:
-    apply_style(cfg)
+    if show_separators:
+        for y in bounds:
+            ax_den.axhline(y, color=separator_color, lw=separator_lw, alpha=separator_alpha, zorder=2)
 
-    if isinstance(run_mode, str) and run_mode.upper() == "ALL":
-        sessions = list_sessions_with_labels(data_root, cfg["LABELS_NAME"])
-        print(f"[INFO] Mode ALL: found {len(sessions)} session(s) with labels.")
-    else:
-        sessions = list(run_mode)
+    # Base faint fill (x>=0)
+    ax_den.fill_betweenx(y_centers, 0.0, dens, color="black", alpha=float(density_fill_alpha), linewidth=0, zorder=4)
 
-    out_root = cfg.get("OUT_ROOT", None)
-    out_root_path = Path(out_root) if out_root else None
-    if out_root_path:
-        out_root_path.mkdir(parents=True, exist_ok=True)
-        print(f"[INFO] OUT_ROOT = {out_root_path}")
+    # Curve colored by region (ONE LINE ONLY)
+    start = 0
+    while start < y_centers.size:
+        rr = lab_y[start]
+        end = start + 1
+        while end < y_centers.size and lab_y[end] == rr:
+            end += 1
 
-    for session in sessions:
-        probes = find_probes_for_session(data_root, session, cfg["LABELS_NAME"])
-        if not probes:
-            print(f"[WARN] No probes found for session: {session}")
-            continue
+        col = region_colors.get(rr, (0.15, 0.15, 0.15))
+        ax_den.plot(dens[start:end], y_centers[start:end], color=col, lw=float(density_line_lw), zorder=6)
 
-        if out_root_path:
-            out_dir = out_root_path
-        else:
-            out_dir = data_root / session / cfg["OUT_DIRNAME"]
-            out_dir.mkdir(parents=True, exist_ok=True)
+        start = end
 
-        for alf_probe in probes:
-            out_png = out_dir / f"{session}_{alf_probe.name}_dashboard.png"
-            ok = make_dashboard_png(session, alf_probe, out_png, cfg)
-            if ok:
-                print(f"[OK] {out_png}")
-            else:
-                print(f"[SKIP] {session} / {alf_probe.name}")
-
-
-if __name__ == "__main__":
-    print("Import this module and call run_dashboards(data_root, run_mode, cfg).")
+    return fig, {"heatmap": ax_hm, "density": ax_den}
