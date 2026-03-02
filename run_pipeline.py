@@ -12,7 +12,8 @@ DATA_ROOT = Path(r"D:\Data_Mice")
 DB_PATH   = DATA_ROOT / "full_db_all_rigs.feather"
 
 MOUSE_LIST = [
-    "VF066_2025_11_26",
+    "VF065_2025_12_18",
+    "VF069_2025_12_03",
 ]
 
 # Kilosort params 
