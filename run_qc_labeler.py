@@ -3,8 +3,8 @@ import numpy as np
 from functions.qc_labeler import run_qc_labeler, QCParams
 
 #DATA_ROOT = Path(r"D:\Data_Mice")
-DATA_ROOT = Path(r"F:\Data_Mice")
-SESSION_ID = "VF066_2025_12_05"
+DATA_ROOT = Path(r"F:\Data_Mice_IBL\VF074 - Copie")
+SESSION_ID = "2026_03_24"
 
 mc_thresh = None
 nc_thresh = None
